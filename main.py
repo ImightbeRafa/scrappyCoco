@@ -9,6 +9,9 @@ import logging
 import re
 import json
 from datetime import datetime
+from dotenv import load_dotenv
+import os
+import random
 
 # Set up logging
 logging.basicConfig(
@@ -20,10 +23,20 @@ logging.basicConfig(
     ]
 )
 
+# Load environment variables from .env file
+load_dotenv()
+
 class InstagramScraper:
-    def __init__(self, username, password, headless=True):
-        self.username = username
-        self.password = password
+    def __init__(self, headless=True):
+        # Updated constructor
+        self.username = os.getenv('INSTAGRAM_USERNAME')
+        self.password = os.getenv('INSTAGRAM_PASSWORD')
+        
+        # Validate credentials
+        if not self.username or not self.password:
+            raise ValueError("Instagram credentials not found in environment variables. "
+                           "Please check your .env file contains INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD")
+        
         self.followers = set()
         self.emails = []
         self.setup_driver(headless)
@@ -33,14 +46,16 @@ class InstagramScraper:
         try:
             chrome_options = Options()
             if headless:
-                chrome_options.add_argument("--headless")
+                chrome_options.add_argument("--headless=new")  # Updated headless mode
             chrome_options.add_argument("--disable-notifications")
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--window-size=1920,1080")  # Set window size
+            chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
             
             self.driver = webdriver.Chrome(options=chrome_options)
-            self.wait = WebDriverWait(self.driver, 10)
+            self.wait = WebDriverWait(self.driver, 20)  # Increased wait time
             logging.info("WebDriver initialized successfully")
         except Exception as e:
             logging.error(f"Failed to initialize WebDriver: {str(e)}")
@@ -50,7 +65,7 @@ class InstagramScraper:
         """Handle Instagram login with error checking"""
         try:
             logging.info("Attempting to log in to Instagram...")
-            self.driver.get("https://www.instagram.com/accounts/login/")
+            self.driver.get("https://www.instagram.com/")
             time.sleep(5)  # Wait for initial load
 
             # Enter username
@@ -70,12 +85,29 @@ class InstagramScraper:
             login_button.click()
             logging.info("Login button clicked")
 
-            # Wait for login to complete
+            # Wait for login to complete and handle potential pop-ups
             time.sleep(10)
             
+            # Handle "Save Login Info" popup if it appears
+            try:
+                not_now_button = self.driver.find_element(By.XPATH, "//button[text()='Not Now']")
+                not_now_button.click()
+                logging.info("Handled 'Save Login Info' popup")
+                time.sleep(2)
+            except:
+                logging.info("No 'Save Login Info' popup found")
+
+            # Handle notifications popup if it appears
+            try:
+                not_now_button = self.driver.find_element(By.XPATH, "//button[text()='Not Now']")
+                not_now_button.click()
+                logging.info("Handled notifications popup")
+            except:
+                logging.info("No notifications popup found")
+
             # Verify login success
             try:
-                self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "svg[aria-label='Home']")))
+                self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[aria-label='Home']")))
                 logging.info("Successfully logged in to Instagram")
             except TimeoutException:
                 logging.error("Login verification failed - please check credentials")
@@ -90,27 +122,48 @@ class InstagramScraper:
         """Get followers with improved scrolling and error handling"""
         try:
             logging.info(f"Fetching followers for user: {target_user}")
-            self.driver.get(f"https://www.instagram.com/{target_user}/followers/")
-            time.sleep(5)  # Wait for modal to load
+            
+            # First navigate to user's profile
+            self.driver.get(f"https://www.instagram.com/{target_user}/")
+            time.sleep(5)
+            
+            # Click on followers count to open modal
+            followers_link = self.wait.until(EC.presence_of_element_located(
+                (By.XPATH, "//a[contains(@href, '/followers')]")
+            ))
+            followers_link.click()
+            time.sleep(5)
+            
+            # Wait for followers modal to load
+            modal = self.wait.until(EC.presence_of_element_located(
+                (By.XPATH, "//div[@role='dialog']")
+            ))
             
             followers_set = set()
             last_height = 0
             scroll_attempts = 0
             max_scroll_attempts = 3
             
+            # Find the scrollable element in the modal
+            scrollable_div = modal.find_element(By.XPATH, ".//div[contains(@class, '_aano')]")
+            
             while True:
                 # Get current followers
-                follower_elements = self.wait.until(
-                    EC.presence_of_all_elements_located((By.XPATH, "//a[contains(@class, 'notranslate')]"))
+                follower_elements = modal.find_elements(
+                    By.XPATH, ".//a[@role='link' and contains(@href, '/')]"
                 )
                 
                 # Process current batch
                 for follower in follower_elements:
                     try:
                         follower_username = follower.get_attribute('href').split('/')[-2]
-                        followers_set.add(follower_username)
-                        logging.debug(f"Added follower: {follower_username}")
+                        if follower_username and follower_username not in followers_set:
+                            followers_set.add(follower_username)
+                            logging.info(f"Added follower: {follower_username}")
                     except StaleElementReferenceException:
+                        continue
+                    except Exception as e:
+                        logging.warning(f"Error processing follower element: {str(e)}")
                         continue
                 
                 logging.info(f"Current number of followers collected: {len(followers_set)}")
@@ -120,12 +173,19 @@ class InstagramScraper:
                     logging.info(f"Reached maximum followers limit: {max_followers}")
                     break
                 
-                # Scroll down
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
+                # Scroll the modal
+                self.driver.execute_script(
+                    "arguments[0].scrollTop = arguments[0].scrollHeight", 
+                    scrollable_div
+                )
+                time.sleep(3)  # Increased wait time for loading
                 
                 # Check if we've reached the bottom
-                new_height = self.driver.execute_script("return document.body.scrollHeight")
+                new_height = self.driver.execute_script(
+                    "return arguments[0].scrollHeight", 
+                    scrollable_div
+                )
+                
                 if new_height == last_height:
                     scroll_attempts += 1
                     if scroll_attempts >= max_scroll_attempts:
@@ -134,7 +194,7 @@ class InstagramScraper:
                 else:
                     scroll_attempts = 0
                     last_height = new_height
-                
+            
             self.followers = followers_set
             logging.info(f"Successfully collected {len(self.followers)} followers")
             return self.followers
@@ -157,14 +217,22 @@ class InstagramScraper:
                     logging.info(f"Processed {processed_count}/{len(self.followers)} followers")
                 
                 self.driver.get(f"https://www.instagram.com/{follower}/")
-                time.sleep(1)  # Small delay to prevent rate limiting
+                time.sleep(2)  # Increased delay
                 
-                bio = self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, "//meta[@property='og:description']"))
-                ).get_attribute("content")
+                try:
+                    # Try to get bio text directly
+                    bio_element = self.wait.until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, ".-vDIg"))
+                    )
+                    bio = bio_element.text
+                except:
+                    # Fallback to meta description
+                    bio = self.wait.until(
+                        EC.presence_of_element_located((By.XPATH, "//meta[@property='og:description']"))
+                    ).get_attribute("content")
                 
                 # Use regex to find email patterns
-                email_pattern = r'[\w\.-]+@[\w\.-]+'
+                email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
                 found_emails = re.findall(email_pattern, bio)
                 
                 for email in found_emails:
@@ -178,6 +246,9 @@ class InstagramScraper:
             except Exception as e:
                 logging.warning(f"Error processing follower {follower}: {str(e)}")
                 continue
+            
+            # Add a random delay between profile visits
+            time.sleep(random.uniform(1, 3))
         
         self.emails = emails
         logging.info(f"Email extraction completed. Found {len(emails)} email addresses")
@@ -185,9 +256,21 @@ class InstagramScraper:
         return emails
 
     def validate_email(self, email):
-        """Basic email validation"""
+        """Enhanced email validation"""
         pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
-        return bool(re.match(pattern, email))
+        if not re.match(pattern, email):
+            return False
+        if len(email) > 254:
+            return False
+        try:
+            local_part, domain = email.split('@')
+            if len(local_part) > 64:
+                return False
+            if domain.endswith('.'):
+                return False
+        except:
+            return False
+        return True
 
     def save_results(self):
         """Save results to a JSON file"""
@@ -220,16 +303,30 @@ class InstagramScraper:
             logging.error(f"Error during cleanup: {str(e)}")
 
 def main():
-    # Replace with your credentials
-    scraper = InstagramScraper(
-        username="ralauas",
-        password="21126Ac8*",
-        headless=True
-    )
-    
+    scraper = None  # Initialize scraper as None
     try:
+        # Add .env file check
+        if not os.path.exists('.env'):
+            logging.warning(".env file not found, creating template...")
+            with open('.env', 'w') as f:
+                f.write("INSTAGRAM_USERNAME=your_username_here\n")
+                f.write("INSTAGRAM_PASSWORD=your_password_here\n")
+                f.write("TARGET_USERNAME=default_target\n")
+                f.write("MAX_FOLLOWERS=1000\n")
+            logging.info("Please update the .env file with your credentials and run the script again.")
+            return
+
+        # Updated scraper initialization
+        scraper = InstagramScraper(headless=False)
+        
         scraper.login()
-        followers = scraper.get_followers("quark.cr", max_followers=1000)  # Limit to 1000 followers
+        time.sleep(5)
+        
+        # Get settings from environment variables
+        target_username = os.getenv('TARGET_USERNAME', 'default_target')
+        max_followers = int(os.getenv('MAX_FOLLOWERS', '1000'))
+        
+        followers = scraper.get_followers(target_username, max_followers)
         emails = scraper.extract_emails()
         
         logging.info(f"Final Results:")
@@ -240,7 +337,8 @@ def main():
     except Exception as e:
         logging.error(f"Script failed: {str(e)}")
     finally:
-        scraper.cleanup()
+        if scraper:  # Only cleanup if scraper was initialized
+            scraper.cleanup()
 
 if __name__ == "__main__":
     main()
